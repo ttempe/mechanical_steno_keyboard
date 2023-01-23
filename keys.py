@@ -1,7 +1,3 @@
-from machine import Pin, ADC
-import time, array, sys, os, json
-
-
 #     Hobbyist Steno Keyboard - MicroPython driver for a hobbyist steno machine (keyboard)
 #     Copyright (C) 2023 Thomas TEMPE
 # 
@@ -27,6 +23,10 @@ import time, array, sys, os, json
 # Add key repeat support
 # Add a way to send parameters or commands from a Plover plug-in
 # Measure power consumption. See if we can decrease it by toggling the Hall effect sensors on and off
+
+import time, supervisor, array, os, json
+import digitalio, analogio, board
+import usb_cdc
 
 #Keymap
 #address  0  1  2  3  4  5  6  7  | 8  9  10  11  12  13  14  15 | 16  17  18  19  20  21  22  23 | 24 25 26 27 28 29 30 31
@@ -66,23 +66,29 @@ __protocol = [[ 28,  2,  2,  2,  2,  2,  2],
 
 __hw_cal_file = "hardware_calibration.json"
 
+def pinOut(p):
+    ret = digitalio.DigitalInOut(p)
+    ret.direction = digitalio.Direction.OUTPUT
+    return ret
+
 class Keys: 
     def __init__(self):
         #Pins
-        self.muxA = Pin( 9, Pin.OUT)
-        self.muxB = Pin(10, Pin.OUT)
-        self.muxC = Pin(11, Pin.OUT)
-        self.muxInh = Pin(12, Pin.OUT)
-        self.ADC = [ ADC(Pin(i, Pin.IN)) for i in [26, 27, 28, 29]]
-        self.LED_act = Pin(25, Pin.OUT)
-        self.LED_cal = Pin(24, Pin.OUT)
-        self.SW_cal = Pin(19, Pin.IN, Pin.PULL_UP)
+        self.muxA =   pinOut(board.GP9 )
+        self.muxB =   pinOut(board.GP10)
+        self.muxC =   pinOut(board.GP11)
+        self.muxInh = pinOut(board.GP12)
+        self.ADC = [analogio.AnalogIn(i) for i in [board.A0, board.A1, board.A2, board.A3]]
+        self.LED_act = pinOut(board.GP25)
+        self.LED_cal = pinOut(board.GP24)
+        self.SW_cal =  digitalio.DigitalInOut(board.GP19) #In
+        self.SW_cal.pull = digitalio.Pull.UP
         
         #Buffers
         self.readings = array.array("I", (0 for i in range(32)))    #16-bit ADC reading
         self.output = array.array("B", (0 for i in range(32)))      # 8-bit normalized values
         self.prev_output = array.array("B", (0 for i in range(32))) # same
-        self.serial = sys.stdout.buffer
+        self.serial = usb_cdc.data
         self.gemini_buffer = bytearray(6)
 
         #bitmap of currently pressed keys
@@ -108,12 +114,12 @@ class Keys:
         self.r_mask = 0b1111111111111100000000000000 #right hand
         
     def set_address(self, mux):
-            self.muxInh(1)
-            time.sleep_ms(1)
-            self.muxA(mux&1)
-            self.muxB(mux&2)
-            self.muxC(mux&4)
-            self.muxInh(0)
+            self.muxInh.value = 1
+            time.sleep(0.001) #TODO: does it work without?
+            self.muxA.value = mux&1
+            self.muxB.value = mux&2
+            self.muxC.value = mux&4
+            self.muxInh.value = 0
 
     def read(self):
         "One loop of polling all the keys. Get the results in the object attributes. Returns whether there was a change in the 8-bit normalized readings"
@@ -127,7 +133,7 @@ class Keys:
                 addr=i+j*8
                 if (self.mask >> addr) & 1:
                     #Read analog
-                    self.readings[addr] = val = ADC.read_u16()
+                    self.readings[addr] = val = ADC.value
                     #Normalize
                     val = abs(val-self.zero[addr])*255//abs(self.max[addr]-self.zero[addr])
                     self.output[addr] = val = min(255, max(0, val))
@@ -141,48 +147,48 @@ class Keys:
 
     def write(self):
         "Write out the current stroke on the console using Gemini PR protocol"
-        self.LED_act(1)
+        self.LED_act.value = 1
         for c in range(6):
             self.gemini_buffer[c] = 0
             for i, j in enumerate(__protocol[c]):
                 self.gemini_buffer[c] += ((self.stroke>>__protocol[c][i])&0x01)<<(6-i)
         self.gemini_buffer[0] |= 0x80
-        sys.stdout.buffer.write(self.gemini_buffer)
-        time.sleep_ms(100)
-        self.LED_act(0)
+        self.serial.write(self.gemini_buffer)
+        time.sleep(.1)
+        self.LED_act.value = 0
 
     def calibrate(self):
         "Hardware calibration sequence"
         
         #Phase 1: hold the calibration button for at least 2 seconds. Read the "resting" key values.
-        t0 = time.ticks_ms()
-        elapsed = lambda :time.ticks_ms()-t0
+        t0 = supervisor.ticks_ms()
+        elapsed = lambda :supervisor.ticks_ms()-t0
         vMin0 = [65535]*32
         vMax0 = [0]*32
-        time.sleep_ms(100)#anti-rebound
+        time.sleep(.1)#anti-rebound
         print("Starting calibration.\nPlease hold the calibration button until flashing stops. Please don't press the keys during that time.")
-        while(not(self.SW_cal())):
-            self.LED_cal((time.ticks_ms()>>6) & 1 and (elapsed() < 2000)) #Flash rapidly for the first 2 seconds, then turn off
+        while(not(self.SW_cal.value)):
+            self.LED_cal.value = (supervisor.ticks_ms()>>6) & 1 and (elapsed() < 2000) #Flash rapidly for the first 2 seconds, then turn off
             self.read()
             #There is some jitter. Measure both the hightest and lowest value, and choose the best one at the end of phase 2
             vMin0 = [min(vMin0[i], self.readings[i]) for i in range(32) ]
             vMax0 = [max(vMax0[i], self.readings[i]) for i in range(32) ]
         if elapsed() < 2000:
-            self.LED_cal(0)
+            self.LED_cal.value = 0
             print("Calibration aborted.")
             return
         
         #Phase 2: record the max (or min) values
         vPressed = vMin0[:]
         print("Please now press down each key all the way\nPress the calibration when you are done")
-        while (self.SW_cal()):
-            self.LED_cal((time.ticks_ms()>>8)&1) #Flash slowly
+        while (self.SW_cal.value):
+            self.LED_cal.value = (supervisor.ticks_ms()>>8)&1 #Flash slowly
             self.read()
             #Depending on the magnet orientation, values are either increasing or decreasing relative to the resting position. Take the most distant one
             vPressed = [self.readings[i] if abs(self.readings[i]-vMin0[i])>abs(vPressed[i]-vMin0[i])  else vPressed[i] for i in range(32) ]
         #Select the best resting position depending on the magnet orientation
         zero = [vMin0[i] if vPressed[i]<vMin0[i] else vMax0[i] for i in range(32)]
-        self.LED_cal(1)
+        self.LED_cal.value = 1
         
         #Control that the calibration is good
         #TODO after hardware is stabilized: check that all keys in self.mask have been pressed, otherwise roll back with an error message
@@ -200,17 +206,17 @@ class Keys:
         fd = open(__hw_cal_file, "w")
         json.dump((self.zero, self.max), fd)
         fd.close()
-        self.LED_cal(0)
+        self.LED_cal.value = 0
         print("calibration recorded. Using the new values")
-        time.sleep_ms(100) #anti-rebound
-        while(not(self.SW_cal())):
+        time.sleep(.1) #anti-rebound
+        while(not(self.SW_cal.value)):
             #Waiting for key release
             pass
-        time.sleep_ms(100) #anti-rebound
+        time.sleep(.1) #anti-rebound
 
     def loop(self):
         "Main loop for using as a steno machine, using the Gemini PR protocole"
-        if not(self.SW_cal()):
+        if not(self.SW_cal.value):
             #Calibration button was held down on startup. Revert to factory values.
             print("Reverting calibration to factory defaults")
             try:
@@ -219,7 +225,7 @@ class Keys:
                 pass
             self.__init__()
             #Wait for cal button release
-            while not(self.SW_cal()):
+            while not(self.SW_cal.value):
                 pass
             
         while True:
@@ -234,7 +240,7 @@ class Keys:
                     self.stroke |= self.pressed
                     
             #See if we need to start a calibration sequence
-            if not(self.SW_cal()):
+            if not(self.SW_cal.value):
                 self.calibrate()
 
 
@@ -243,7 +249,7 @@ def monitor_readings():
     while True:
         k.read()
         print(k.readings)
-        time.sleep_ms(100) 
+        time.sleep(.1) 
 
 def monitor_normalized():
     "Real-time display of all 25 keys' 8-bit normalized readings"
@@ -254,7 +260,7 @@ def monitor_normalized():
     while True:
         k.read()
         print([k.output[i] for i in listed_keys])
-        time.sleep_ms(100)
+        time.sleep(.1)
 
 def monitor_output():
     "Real-time display of the keys' on-off status"
@@ -263,7 +269,7 @@ def monitor_output():
         if k.pressed != k.prev_pressed:
             t = bin(k.pressed)[2:]
             print(("0"*(27-len(t)))+t)
-            time.sleep_ms(10)
+            time.sleep(.01)
     
 
 def minmax():
@@ -278,22 +284,22 @@ def minmax():
         for i, v in enumerate(k.readings):
             max_val[i]=max(v, max_val[i])
             min_val[i]=min(v, min_val[i])
-        if (time.ticks_ms() - last_time > 1000):
-            last_time = time.ticks_ms()
+        if (supervisor.ticks_ms() - last_time > 1000):
+            last_time = supervisor.ticks_ms()
             print("Min: ", min_val)
             print("Max: ", max_val)
-            time.sleep_ms(50)
+            time.sleep(.05)
                     
 def read_one(mux, input):
     "Gives the measured voltage for one sensor"
     k.set_address(input)
-    print("S{}-{} : {:.3} V".format(mux, input, k.ADC[mux].read_u16()*3.3/65535)) 
+    print("S{}-{} : {:.3} V".format(mux, input, k.ADC[mux].value*3.3/65535)) 
 
 def time_once():
     "How many microseconds to poll once?"
-    t=time.ticks_us()
+    t=supervisor.ticks_us()
     k.read()
-    print("Polling once takes", time.ticks_us()-t, "us")
+    print("Polling once takes", supervisor.ticks_us()-t, "us")
 
 k = Keys()
 #monitor_readings()
