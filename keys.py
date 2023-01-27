@@ -34,10 +34,17 @@ import usb_cdc
 
 #index = address
 __key_names = ["S1", "S2", "#", "T", "K", "-", "P", "W", "A", "H", "R", "O", "*1", "*2", "E", "F", "-R", "-U", "-P", "-B", "-L", "-G", "--", "-T", "-S", "#2", "-D", "-Z"]
-__finger_spelling = {"a":["A", "#", "-P"]}
-__gemini_codes = {"S":0x006000000000, "T":0x001000000000, "K":0x000800000000, "P":0x000400000000, "W":0x000200000000,
-                  "H":0x000100000000, "R":0x000040000000, "A":0x000020000000, "O":0x000010000000, "#":0x3F000000007E,
-                  "*":0x00000C300000, "E":0x000000080000, "U":0x000000040000,"-P":0x000000004000}
+__finger_spelling = {"a":["A", "*"], "b":["P", "W", "*"], "c":["K", "R", "*"], "d":["T", "K", "*"], "e":["E", "*"], "f":["T", "P", "*"], "g":["T", "P", "K", "W", "*"],
+                     "h":["H", "*"], "i":["E", "U", "*"], "j":["S", "K", "W", "R", "*"], "k":["K", "*"], "l":["H", "R", "*"], "m":["P", "H", "*"], "n":["T", "P", "H", "*"],
+                     "o":["O", "*"], "p":["P", "*"], "q":["K", "W", "*"], "r":["R", "*"], "s":["S", "*"], "t":["T", "*"], "u":["U", "*"], "v":["S", "R", "*"], "w":["W", "*"],
+                     "x":["K", "P", "*"], "y":["K", "W", "R", "*"], "Z":["S", "T", "P", "K", "W", "*"], ":":["K", "H", "R", "-P", "-B"], ".":["P", "-P"],
+                     " ":["S", "-P"], "\\":["R", "-R"], "'":["S", "K", "W", "*", "-T"], "1":["#", "S"], "2":["#", "T"], ",":["W", "-B"], "#":["#"], "-":["H", "-B"], "*":["*"],
+                     "_":["R", "U", "-P", "-B", "-D"]}
+__gemini_codes = {"S" :0x006000000000, "T" :0x001000000000, "K" :0x000800000000, "P" :0x000400000000,  "W":0x000200000000,
+                  "H" :0x000100000000, "R" :0x000040000000, "A" :0x000020000000, "O" :0x000010000000,  "#":0x3F000000007E,
+                  "*" :0x00000C300000, "E" :0x000000080000, "U" :0x000000040000, "-P":0x000000004000, "-L":0x000000001000,
+                  "-B":0x000000002000, "-L":0x000000001000, "-S":0x000000000200, "-D":0x000000000100, "-T":0x000000000400,
+                  "-R":0x000000010000}
 
 ### Extract from Plover code:
 # In the Gemini PR protocol, each packet consists of exactly six bytes
@@ -65,7 +72,7 @@ __protocol = [[ 28,  2,  2,  2,  2,  2,  2],
               [  2,  2,  2,  2,  2,  2, 27]]
 
 __hw_cal_file = "hardware_calibration.json"
-
+        
 def pinOut(p):
     ret = digitalio.DigitalInOut(p)
     ret.direction = digitalio.Direction.OUTPUT
@@ -113,6 +120,22 @@ class Keys:
         self.l_mask = 0b111111111111                 #left hand
         self.r_mask = 0b1111111111111100000000000000 #right hand
         
+    def fingerSpell(self, text):
+        "Send a string to the user through the Gemini protocol. Use '\\' for line breaks."
+        for letter in text:
+            code = 0x800000000000
+            if letter.isupper():
+                code |= __gemini_codes["-P"]
+                letter = letter.lower()
+            if letter not in __finger_spelling.keys():
+                letter = "*"
+            for key in __finger_spelling[letter]:
+                code |= __gemini_codes[key]
+            for i in range(6):
+                self.gemini_buffer[5-i] = 0xFF & (code >> (8*i))
+            self.serial.write(self.gemini_buffer)
+
+
     def set_address(self, mux):
             self.muxInh.value = 1
             time.sleep(0.001) #TODO: does it work without?
@@ -146,12 +169,12 @@ class Keys:
         return self.pressed != self.prev_pressed
 
     def write(self):
-        "Write out the current stroke on the console using Gemini PR protocol"
+        "Write out the current or given stroke on the console using Gemini PR protocol"
         self.LED_act.value = 1
         for c in range(6):
             self.gemini_buffer[c] = 0
             for i, j in enumerate(__protocol[c]):
-                self.gemini_buffer[c] += ((self.stroke>>__protocol[c][i])&0x01)<<(6-i)
+                self.gemini_buffer[c] += ((self.stroke >>__protocol[c][i])&0x01)<<(6-i)
         self.gemini_buffer[0] |= 0x80
         self.serial.write(self.gemini_buffer)
         time.sleep(.1)
@@ -166,7 +189,7 @@ class Keys:
         vMin0 = [65535]*32
         vMax0 = [0]*32
         time.sleep(.1)#anti-rebound
-        print("Starting calibration.\nPlease hold the calibration button until flashing stops. Please don't press the keys during that time.")
+        self.fingerSpell("Starting calibration.\\Please hold the calibration button until flashing stops.\\Please don't press any key during that time.\\\\")
         while(not(self.SW_cal.value)):
             self.LED_cal.value = (supervisor.ticks_ms()>>6) & 1 and (elapsed() < 2000) #Flash rapidly for the first 2 seconds, then turn off
             self.read()
@@ -175,12 +198,12 @@ class Keys:
             vMax0 = [max(vMax0[i], self.readings[i]) for i in range(32) ]
         if elapsed() < 2000:
             self.LED_cal.value = 0
-            print("Calibration aborted.")
+            self.fingerSpell("Calibration aborted.\\\\")
             return
         
         #Phase 2: record the max (or min) values
         vPressed = vMin0[:]
-        print("Please now press down each key all the way\nPress the calibration when you are done")
+        self.fingerSpell("Please now press down each key all the way\\Press the calibration button again when you are done.\\\\")
         while (self.SW_cal.value):
             self.LED_cal.value = (supervisor.ticks_ms()>>8)&1 #Flash slowly
             self.read()
@@ -194,10 +217,10 @@ class Keys:
         #TODO after hardware is stabilized: check that all keys in self.mask have been pressed, otherwise roll back with an error message
         err = []
         for i in range(32):
-            if self.mask&(1<<i) and abs(vPressed[i] - zero[i]) < 2:
+            if self.mask&(1<<i) and abs(vPressed[i] - zero[i]) < 0: #Replace "0" with a reasonnably large value
                 err.append(__key_names[i])
         if len(err):
-            print("Error: the following keys were not calibrated: ", err)
+            self.fingerSpell("Error: the following keys were not calibrated: {}\\\\".format(err))
             return
         
         #Record calibration to file, and apply it
@@ -207,7 +230,7 @@ class Keys:
         json.dump((self.zero, self.max), fd)
         fd.close()
         self.LED_cal.value = 0
-        print("calibration recorded. Using the new values")
+        self.fingerSpell("calibration recorded.\\Using the new values.\\\\")
         time.sleep(.1) #anti-rebound
         while(not(self.SW_cal.value)):
             #Waiting for key release
@@ -218,7 +241,7 @@ class Keys:
         "Main loop for using as a steno machine, using the Gemini PR protocole"
         if not(self.SW_cal.value):
             #Calibration button was held down on startup. Revert to factory values.
-            print("Reverting calibration to factory defaults")
+            self.fingerSpell("Calibration button held on startup.\\Reverting calibration to factory defaults.\\\\")
             try:
                 os.remove(__hw_cal_file)
             except OSError:
@@ -300,6 +323,13 @@ def time_once():
     t=supervisor.ticks_us()
     k.read()
     print("Polling once takes", supervisor.ticks_us()-t, "us")
+
+def test_dict():
+    "Will cause an error if the Gemini codes dictionary contains a typo"
+    for letter, codes in __finger_spelling.items():
+        for code in codes:
+            print(letter, end="\t");print(code, end="\t");print(__gemini_codes[code])
+        
 
 k = Keys()
 #monitor_readings()
